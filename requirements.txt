@@ -1,4 +1,4 @@
 streamlit
 Pillow
 reportlab
-zxing-cpp
+easyocr
