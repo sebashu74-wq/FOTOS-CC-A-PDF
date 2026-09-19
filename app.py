@@ -1,7 +1,9 @@
 import hashlib
 import io
 import math
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -85,16 +87,40 @@ def extraer_nombre(raw: bytes) -> str:
 
 
 # --------------------------------------------------------- frente (por rostro)
+NOMBRE_CASCADA = "haarcascade_frontalface_default.xml"
+
+
 @st.cache_resource
 def cargar_detector():
-    return cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    """
+    Busca el XML del detector de rostros junto a app.py, en cv2.data o dentro del
+    paquete cv2 (en algunos servidores cv2.data no existe). Devuelve None si no lo halla.
+    """
+    carpetas = [os.path.dirname(os.path.abspath(__file__))]
+    try:
+        carpetas.append(cv2.data.haarcascades)
+    except AttributeError:
+        pass
+    carpetas.append(os.path.join(os.path.dirname(cv2.__file__), "data"))
+    for carpeta in carpetas:
+        ruta = os.path.join(carpeta, NOMBRE_CASCADA)
+        if os.path.exists(ruta):
+            detector = cv2.CascadeClassifier(ruta)
+            if not detector.empty():
+                return detector
+    return None
 
 
-def orientar_frente(img: Image.Image, rot_ref: int):
-    """Prueba los 4 giros en miniatura y elige el que muestra el rostro derecho."""
+def giro_por_rostro(img: Image.Image):
+    """
+    Prueba los 4 giros en miniatura y devuelve (giro_grados, puntaje) del que muestra
+    el rostro derecho. Si no hay rostro en ningún giro: (None, 0).
+    """
     detector = cargar_detector()
+    if detector is None:  # sin XML: se usa el respaldo cruzado con el reverso
+        return None, 0
     mini = img.copy()
-    mini.thumbnail((640, 640))
+    mini.thumbnail((512, 512))
     mejor_ang, mejor_puntaje = None, 0
     for ang in (0, 90, 180, 270):
         m = mini.rotate(ang, expand=True) if ang else mini
@@ -103,14 +129,11 @@ def orientar_frente(img: Image.Image, rot_ref: int):
         puntaje = sum(int(w) * int(h) for (_, _, w, h) in caras)
         if puntaje > mejor_puntaje:
             mejor_ang, mejor_puntaje = ang, puntaje
-    if mejor_ang is not None:
-        return (img.rotate(mejor_ang, expand=True) if mejor_ang else img), True
+    return mejor_ang, mejor_puntaje
 
-    # Respaldo: asumir que se fotografió con la misma orientación que el reverso
-    fr = img.rotate(rot_ref, expand=True) if rot_ref else img
-    if fr.height > fr.width:
-        fr = fr.rotate(90, expand=True)
-    return fr, False
+
+def aplicar_giro(img: Image.Image, ang: int) -> Image.Image:
+    return img.rotate(ang, expand=True) if ang else img
 
 
 # ------------------------------------------------------------- procesamiento
@@ -120,8 +143,10 @@ def analizar(datos_a: bytes, datos_b: bytes):
     datos = (datos_a, datos_b)
     idx_rev, hit, imgs = None, None, None
 
+    # 1) Reverso = la imagen donde se lee el PDF417 (rápido primero, más resolución si falla)
     for tam in TAMS_ESCANEO:
-        imgs = [abrir_imagen(d, tam) for d in datos]
+        with ThreadPoolExecutor(2) as ex:  # decodifica ambas fotos en paralelo
+            imgs = list(ex.map(lambda d: abrir_imagen(d, tam), datos))
         for i, img in enumerate(imgs):
             hit = leer_pdf417(img)
             if hit:
@@ -130,23 +155,36 @@ def analizar(datos_a: bytes, datos_b: bytes):
         if idx_rev is not None:
             break
 
+    # 2) Frente = la otra imagen; su giro sale del rostro
     if idx_rev is None:
-        idx_rev = 1  # sin código: se asume que la segunda es el reverso
+        # Sin código legible: el frente es la imagen donde se detecta el rostro
+        g0, g1 = giro_por_rostro(imgs[0]), giro_por_rostro(imgs[1])
+        idx_fre = 1 if g1[1] > g0[1] else 0
+        idx_rev = 1 - idx_fre
+        ang_fre = (g1 if idx_fre == 1 else g0)[0]
+    else:
+        ang_fre = giro_por_rostro(imgs[1 - idx_rev])[0]
+
     img_rev, img_fre = imgs[idx_rev], imgs[1 - idx_rev]
 
-    rot, nombre = 0, ""
+    rot_rev, nombre = None, ""
     if hit:
-        rot, raw = hit
-        if rot:
-            img_rev = img_rev.rotate(rot, expand=True)
+        rot_rev, raw = hit
         nombre = extraer_nombre(raw)
+    codigo_ok, cara_ok = hit is not None, ang_fre is not None
 
-    img_fre, cara_ok = orientar_frente(img_fre, rot)
+    # Respaldo cruzado: si falta uno de los dos giros, se asume que ambas fotos se tomaron igual
+    if rot_rev is None:
+        rot_rev = ang_fre or 0
+    if ang_fre is None:
+        ang_fre = rot_rev
 
+    img_rev = aplicar_giro(img_rev, rot_rev)
+    img_fre = aplicar_giro(img_fre, ang_fre)
     for im in (img_fre, img_rev):
         im.thumbnail((TAM_PDF, TAM_PDF), Image.Resampling.LANCZOS)
 
-    return img_fre, img_rev, nombre, hit is not None, cara_ok
+    return img_fre, img_rev, nombre, codigo_ok, cara_ok
 
 
 def crear_pdf(img_frente: Image.Image, img_reverso: Image.Image) -> io.BytesIO:
