@@ -1,4 +1,7 @@
-streamlit
+streamlit>=1.50
 Pillow
 reportlab
-zxing-cpp
+zxing-cpp>=2.2
+opencv-python-headless
+numpy
+ 
