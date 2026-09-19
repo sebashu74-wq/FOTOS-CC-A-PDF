@@ -2,82 +2,97 @@ import io
 import re
 import streamlit as st
 from PIL import Image, ImageOps
-import pytesseract
+from pyzbar.pyzbar import decode
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-st.set_page_config(page_title="Unificador de Cédulas", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Unificador Cédulas Colombia", page_icon="📄", layout="wide")
 
 st.title("📄 Unificador de Cédula a PDF")
 
-# Inicializar estados de rotación
+# Session state para mantener las rotaciones instantáneas
 if "rot_frente" not in st.session_state:
     st.session_state.rot_frente = 0
 if "rot_reverso" not in st.session_state:
     st.session_state.rot_reverso = 0
 
-def comprimir_y_orientar_rapido(img):
-    """Corrige la orientación EXIF, reduce resolución a máx 800px para velocidad extrema."""
+def comprimir_ultra_rapido(img, max_dim=750):
+    """Aplica orientación EXIF inicial y comprime la imagen para máxima velocidad."""
     img = ImageOps.exif_transpose(img)
-    if img.height > img.width:
-        img = img.rotate(270, expand=True)
-    
-    # Redimensionar agresivamente para eliminar demora de procesamiento
-    max_dim = 800
     if max(img.width, img.height) > max_dim:
         img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-        
     return img
 
-def extraer_datos_y_clasificar(img1, img2):
-    """Analiza las imágenes con OCR rápido para clasificar Frente/Trasera y obtener Nombre completo."""
-    def obtener_texto(img):
-        try:
-            # Reducir imagen para OCR ultra rápido
-            img_ocr = img.copy()
-            img_ocr.thumbnail((600, 600))
-            return pytesseract.image_to_string(img_ocr, lang="spa").upper()
-        except Exception:
-            return ""
-
-    txt1 = obtener_texto(img1)
-    txt2 = obtener_texto(img2)
-
-    palabras_frente = ["REPUBLICA", "IDENTIFICACION", "CEDULA", "NOMBRES", "APELLIDOS", "COLOMBIA"]
-    score1 = sum(1 for p in palabras_frente if p in txt1)
-    score2 = sum(1 for p in palabras_frente if p in txt2)
-
-    if score1 >= score2:
-        img_frente, img_trasera = img1, img2
-        texto_frente = txt1
-    else:
-        img_frente, img_trasera = img2, img1
-        texto_frente = txt2
-
-    # Intentar extraer Nombre y Apellido
-    nombre_archivo = "Cedula_Documento.pdf"
-    try:
-        lineas = [linea.strip() for linea in texto_frente.split("\n") if linea.strip()]
-        nombres_encontrados = []
+def leer_pdf417_cedula(img):
+    """
+    Escanea el código de barras PDF417 de la cédula colombiana en los 4 ángulos.
+    Retorna: (imagen_orientada_correctamente, datos_persona, exito)
+    """
+    for angulo in [0, 90, 180, 270]:
+        img_rotada = img.rotate(angulo, expand=True) if angulo != 0 else img
+        codigos = decode(img_rotada)
         
-        for i, linea in enumerate(lineas):
-            if "APELLIDOS" in linea and (i + 1) < len(lineas):
-                nombres_encontrados.append(lineas[i + 1])
-            elif "NOMBRES" in linea and (i + 1) < len(lineas):
-                nombres_encontrados.append(lineas[i + 1])
+        for codigo in codigos:
+            if codigo.type in ['PDF417', 'CODE128']:
+                try:
+                    # Decodificar datos binarios/texto del código de barras de la registraduría
+                    raw_data = codigo.data.decode('latin-1', errors='ignore')
+                    
+                    # Extraer texto legible (Nombres y Apellidos)
+                    partes = [p for p in re.split(r'[\x00-\x1F\x7F-\xFF]+', raw_data) if len(p) > 2]
+                    texto_limpio = " ".join(partes)
+                    
+                    # Buscar palabras en mayúscula de nombres colombianos
+                    coincidencias = re.findall(r'[A-ZÑÁÉÍÓÚ]{3,}', texto_limpio)
+                    if len(coincidencias) >= 2:
+                        nombre_completo = " ".join(coincidencias[:4])
+                        return img_rotada, nombre_completo, True
+                except Exception:
+                    pass
+                return img_rotada, "", True
 
-        if nombres_encontrados:
-            cadena_nombre = " ".join(nombres_encontrados)
-            cadena_limpia = re.sub(r'[^A-ZÁÉÍÓÚÑ\s]', '', cadena_nombre).strip()
-            if len(cadena_limpia) > 3:
-                nombre_archivo = f"Cedula {cadena_limpia}.pdf"
-    except Exception:
-        pass
+    return img, "", False
 
-    return img_frente, img_trasera, nombre_archivo
+def orientar_frente_por_rostro(img):
+    """Asegura que el frente quede horizontal basándose en dimensiones y proporciones."""
+    if img.height > img.width:
+        img = img.rotate(270, expand=True)
+    return img
 
-# --- INTERFAZ DE USUARIO ---
+def procesar_cedulas(img1_raw, img2_raw):
+    """Clasifica, orienta automáticamente y extrae el nombre."""
+    img1 = comprimir_ultra_rapido(img1_raw)
+    img2 = comprimir_ultra_rapido(img2_raw)
+
+    # 1. Intentar detectar reverso usando el código de barras PDF417
+    img1_ori, nombre1, es_reverso1 = leer_pdf417_cedula(img1)
+    
+    if es_reverso1:
+        img_reverso_final = img1_ori
+        img_frente_final = orientar_frente_por_rostro(img2)
+        nombre_detectado = nombre1
+    else:
+        img2_ori, nombre2, es_reverso2 = leer_pdf417_cedula(img2)
+        if es_reverso2:
+            img_reverso_final = img2_ori
+            img_frente_final = orientar_frente_por_rostro(img1)
+            nombre_detectado = nombre2
+        else:
+            # Si no detectó código de barras, asumir por tamaño/orientación por defecto
+            img_frente_final = orientar_frente_por_rostro(img1)
+            img_reverso_final = orientar_frente_por_rostro(img2)
+            nombre_detectado = ""
+
+    # Formatear el nombre del archivo PDF
+    if nombre_detectado:
+        nombre_pdf = f"Cedula {nombre_detectado}.pdf"
+    else:
+        nombre_pdf = "Cedula Documento.pdf"
+
+    return img_frente_final, img_reverso_final, nombre_pdf
+
+# --- INTERFAZ STREAMLIT ---
 col_izq, col_der = st.columns([2, 1])
 
 img_frente_raw = None
@@ -88,50 +103,47 @@ with col_der:
     modo = st.radio("Método de carga:", ["Arrastrar las 2 fotos juntas", "Subir por separado"])
 
     if modo == "Arrastrar las 2 fotos juntas":
-        archivos = st.file_uploader("Arrastra o selecciona las 2 imágenes aquí", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+        archivos = st.file_uploader("Selecciona o arrastra las 2 imágenes aquí", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
         if archivos and len(archivos) == 2:
-            with st.spinner("Procesando y clasificando..."):
+            with st.spinner("Procesando lectura rápida..."):
                 i1 = Image.open(archivos[0])
                 i2 = Image.open(archivos[1])
-                img_frente_raw, img_reverso_raw, nombre_pdf_sugerido = extraer_datos_y_clasificar(i1, i2)
+                img_frente_raw, img_reverso_raw, nombre_pdf_sugerido = procesar_cedulas(i1, i2)
     else:
         f_file = st.file_uploader("1. Cédula Frente (Arriba)", type=["jpg", "jpeg", "png"])
         r_file = st.file_uploader("2. Cédula Trasera (Abajo)", type=["jpg", "jpeg", "png"])
         if f_file and r_file:
-            img_frente_raw = Image.open(f_file)
-            img_reverso_raw = Image.open(r_file)
-            nombre_pdf_sugerido = "Cedula_Documento.pdf"
+            i1 = Image.open(f_file)
+            i2 = Image.open(r_file)
+            img_frente_raw, img_reverso_raw, nombre_pdf_sugerido = procesar_cedulas(i1, i2)
 
 with col_izq:
     if img_frente_raw and img_reverso_raw:
-        st.subheader("👁️ Vista Previa y Descarga")
-
-        img_frente = comprimir_y_orientar_rapido(img_frente_raw)
-        img_reverso = comprimir_y_orientar_rapido(img_reverso_raw)
+        st.subheader("👁️ Vista Previa")
 
         c1, c2 = st.columns(2)
 
         with c1:
-            st.markdown("**1. Frente (Parte Superior)**")
+            st.markdown("**1. Frente (Mitad Superior)**")
             b1, b2 = st.columns(2)
             if b1.button("🔄 Girar 90°", key="f_90"):
                 st.session_state.rot_frente = (st.session_state.rot_frente + 90) % 360
             if b2.button("🙃 Voltear 180°", key="f_180"):
                 st.session_state.rot_frente = (st.session_state.rot_frente + 180) % 360
 
-            img_frente_final = img_frente.rotate(360 - st.session_state.rot_frente, expand=True)
-            st.image(img_frente_final, use_container_width=True)
+            img_frente_render = img_frente_raw.rotate(360 - st.session_state.rot_frente, expand=True)
+            st.image(img_frente_render, use_container_width=True)
 
         with c2:
-            st.markdown("**2. Trasera (Parte Inferior)**")
+            st.markdown("**2. Trasera (Mitad Inferior)**")
             b3, b4 = st.columns(2)
             if b3.button("🔄 Girar 90°", key="r_90"):
                 st.session_state.rot_reverso = (st.session_state.rot_reverso + 90) % 360
             if b4.button("🙃 Voltear 180°", key="r_180"):
                 st.session_state.rot_reverso = (st.session_state.rot_reverso + 180) % 360
 
-            img_reverso_final = img_reverso.rotate(360 - st.session_state.rot_reverso, expand=True)
-            st.image(img_reverso_final, use_container_width=True)
+            img_reverso_render = img_reverso_raw.rotate(360 - st.session_state.rot_reverso, expand=True)
+            st.image(img_reverso_render, use_container_width=True)
 
         st.markdown("---")
 
@@ -148,13 +160,13 @@ with col_izq:
             pos_y = centro_y - (nuevo_alto / 2)
 
             buffer_temp = io.BytesIO()
-            img.convert("RGB").save(buffer_temp, format="JPEG", quality=65)
+            img.convert("RGB").save(buffer_temp, format="JPEG", quality=60)
             buffer_temp.seek(0)
 
             c.drawImage(ImageReader(buffer_temp), pos_x, pos_y, width=nuevo_ancho, height=nuevo_alto)
 
-        agregar_imagen(img_frente_final, alto_pagina * 0.75)
-        agregar_imagen(img_reverso_final, alto_pagina * 0.25)
+        agregar_imagen(img_frente_render, alto_pagina * 0.75)
+        agregar_imagen(img_reverso_render, alto_pagina * 0.25)
 
         c.save()
         pdf_buffer.seek(0)
@@ -169,4 +181,4 @@ with col_izq:
             use_container_width=True
         )
     else:
-        st.info("👈 Utiliza el panel de la derecha para cargar las dos imágenes.")
+        st.info("👈 Utiliza el panel de la derecha para arrastrar o subir las 2 imágenes de la cédula.")
