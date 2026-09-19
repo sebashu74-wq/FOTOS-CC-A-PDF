@@ -2,7 +2,7 @@ import io
 import re
 import streamlit as st
 from PIL import Image, ImageOps
-from pyzbar.pyzbar import decode
+import zxingcpp
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
@@ -18,7 +18,7 @@ if "rot_reverso" not in st.session_state:
     st.session_state.rot_reverso = 0
 
 def comprimir_ultra_rapido(img, max_dim=750):
-    """Aplica orientación EXIF inicial y comprime la imagen para máxima velocidad."""
+    """Aplica orientación EXIF inicial y comprime para velocidad máxima."""
     img = ImageOps.exif_transpose(img)
     if max(img.width, img.height) > max_dim:
         img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
@@ -26,24 +26,25 @@ def comprimir_ultra_rapido(img, max_dim=750):
 
 def leer_pdf417_cedula(img):
     """
-    Escanea el código de barras PDF417 de la cédula colombiana en los 4 ángulos.
-    Retorna: (imagen_orientada_correctamente, datos_persona, exito)
+    Escanea el código de barras PDF417 de la cédula en los 4 ángulos.
+    Retorna: (imagen_orientada_correctamente, nombre_persona, es_reverso)
     """
     for angulo in [0, 90, 180, 270]:
         img_rotada = img.rotate(angulo, expand=True) if angulo != 0 else img
-        codigos = decode(img_rotada)
         
-        for codigo in codigos:
-            if codigo.type in ['PDF417', 'CODE128']:
+        # Leer códigos usando zxing-cpp
+        resultados = zxingcpp.read_barcodes(img_rotada)
+        
+        for res in resultados:
+            if str(res.format) in ["BarcodeFormat.PDF417", "PDF417", "BarcodeFormat.Code128"]:
                 try:
-                    # Decodificar datos binarios/texto del código de barras de la registraduría
-                    raw_data = codigo.data.decode('latin-1', errors='ignore')
+                    raw_data = res.text
                     
                     # Extraer texto legible (Nombres y Apellidos)
                     partes = [p for p in re.split(r'[\x00-\x1F\x7F-\xFF]+', raw_data) if len(p) > 2]
                     texto_limpio = " ".join(partes)
                     
-                    # Buscar palabras en mayúscula de nombres colombianos
+                    # Buscar nombres en mayúsculas
                     coincidencias = re.findall(r'[A-ZÑÁÉÍÓÚ]{3,}', texto_limpio)
                     if len(coincidencias) >= 2:
                         nombre_completo = " ".join(coincidencias[:4])
@@ -54,8 +55,8 @@ def leer_pdf417_cedula(img):
 
     return img, "", False
 
-def orientar_frente_por_rostro(img):
-    """Asegura que el frente quede horizontal basándose en dimensiones y proporciones."""
+def orientar_frente(img):
+    """Asegura orientación horizontal para la cara frontal."""
     if img.height > img.width:
         img = img.rotate(270, expand=True)
     return img
@@ -65,26 +66,24 @@ def procesar_cedulas(img1_raw, img2_raw):
     img1 = comprimir_ultra_rapido(img1_raw)
     img2 = comprimir_ultra_rapido(img2_raw)
 
-    # 1. Intentar detectar reverso usando el código de barras PDF417
+    # Detectar reverso usando el código PDF417
     img1_ori, nombre1, es_reverso1 = leer_pdf417_cedula(img1)
     
     if es_reverso1:
         img_reverso_final = img1_ori
-        img_frente_final = orientar_frente_por_rostro(img2)
+        img_frente_final = orientar_frente(img2)
         nombre_detectado = nombre1
     else:
         img2_ori, nombre2, es_reverso2 = leer_pdf417_cedula(img2)
         if es_reverso2:
             img_reverso_final = img2_ori
-            img_frente_final = orientar_frente_por_rostro(img1)
+            img_frente_final = orientar_frente(img1)
             nombre_detectado = nombre2
         else:
-            # Si no detectó código de barras, asumir por tamaño/orientación por defecto
-            img_frente_final = orientar_frente_por_rostro(img1)
-            img_reverso_final = orientar_frente_por_rostro(img2)
+            img_frente_final = orientar_frente(img1)
+            img_reverso_final = orientar_frente(img2)
             nombre_detectado = ""
 
-    # Formatear el nombre del archivo PDF
     if nombre_detectado:
         nombre_pdf = f"Cedula {nombre_detectado}.pdf"
     else:
