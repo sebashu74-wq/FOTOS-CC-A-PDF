@@ -1,4 +1,4 @@
 streamlit
 Pillow
 reportlab
-pyzbar
+zxing-cpp
