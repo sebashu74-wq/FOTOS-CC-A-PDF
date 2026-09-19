@@ -5,7 +5,6 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-import cv2
 import numpy as np
 import streamlit as st
 import zxingcpp
@@ -13,6 +12,11 @@ from PIL import Image, ImageOps
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+
+try:  # OpenCV es opcional: solo mejora la orientación del frente
+    import cv2
+except Exception:
+    cv2 = None
 
 st.set_page_config(page_title="Unificador Cédulas Colombia", page_icon="📄", layout="wide")
 st.title("📄 Unificador de Cédula a PDF")
@@ -26,7 +30,9 @@ IGNORAR = {"DSK", "PUB", "PUBDSK"}
 def abrir_imagen(datos: bytes, max_dim: int) -> Image.Image:
     """Abre la imagen decodificándola ya reducida (mucho más rápido en fotos de celular)."""
     img = Image.open(io.BytesIO(datos))
-    img.draft("RGB", (max_dim, max_dim))  # solo afecta a JPEG
+    w, h = img.size
+    k = max_dim / max(w, h)
+    img.draft("RGB", (int(w * k), int(h * k)))  # solo JPEG: decodifica ya reducida
     img = ImageOps.exif_transpose(img)
     if img.mode in ("RGBA", "LA", "P"):
         img = img.convert("RGBA")
@@ -90,12 +96,24 @@ def extraer_nombre(raw: bytes) -> str:
 NOMBRE_CASCADA = "haarcascade_frontalface_default.xml"
 
 
+def estado_opencv() -> str:
+    """Texto de diagnóstico si OpenCV no es utilizable ('' si todo está bien)."""
+    if cv2 is None:
+        return "OpenCV no está instalado en el servidor."
+    if not hasattr(cv2, "CascadeClassifier"):
+        return (f"OpenCV está instalado pero incompleto (versión {getattr(cv2, '__version__', '?')}, "
+                f"ruta {getattr(cv2, '__file__', None)}).")
+    return ""
+
+
 @st.cache_resource
 def cargar_detector():
     """
     Busca el XML del detector de rostros junto a app.py, en cv2.data o dentro del
-    paquete cv2 (en algunos servidores cv2.data no existe). Devuelve None si no lo halla.
+    paquete cv2. Devuelve None si OpenCV o el XML no están disponibles.
     """
+    if estado_opencv():
+        return None
     carpetas = [os.path.dirname(os.path.abspath(__file__))]
     try:
         carpetas.append(cv2.data.haarcascades)
@@ -105,9 +123,12 @@ def cargar_detector():
     for carpeta in carpetas:
         ruta = os.path.join(carpeta, NOMBRE_CASCADA)
         if os.path.exists(ruta):
-            detector = cv2.CascadeClassifier(ruta)
-            if not detector.empty():
-                return detector
+            try:
+                detector = cv2.CascadeClassifier(ruta)
+                if not detector.empty():
+                    return detector
+            except Exception:
+                pass
     return None
 
 
@@ -125,7 +146,7 @@ def giro_por_rostro(img: Image.Image):
     for ang in (0, 90, 180, 270):
         m = mini.rotate(ang, expand=True) if ang else mini
         gris = cv2.equalizeHist(np.asarray(m.convert("L")))
-        caras = detector.detectMultiScale(gris, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
+        caras = detector.detectMultiScale(gris, scaleFactor=1.2, minNeighbors=5, minSize=(20, 20))
         puntaje = sum(int(w) * int(h) for (_, _, w, h) in caras)
         if puntaje > mejor_puntaje:
             mejor_ang, mejor_puntaje = ang, puntaje
@@ -273,6 +294,9 @@ with col_izq:
             st.info("El código se leyó, pero no pude extraer el nombre: el archivo se llamará solo 'CC'.")
         if not cara_ok:
             st.warning("No pude detectar el rostro en el frente: revisa su orientación.")
+            diag = estado_opencv()
+            if diag:
+                st.caption("ℹ️ " + diag)
 
         c1, c2 = st.columns(2)
         with c1:
